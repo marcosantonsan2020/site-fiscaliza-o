@@ -1,11 +1,12 @@
 
 import os
-import sys
 import time
 from datetime import datetime, timezone
 from urllib.parse import urljoin
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from supabase import Client, create_client
 
 
@@ -22,6 +23,7 @@ API_MATERIAS = f"{SAPL_BASE}/api/materia/materialegislativa/"
 
 LEGISLATURA_ATUAL = "2025-2028"
 TAMANHO_LOTE = 100
+TIMEOUT_REQUISICAO = 60
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError(
@@ -31,13 +33,36 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+
+# ============================================================
+# SESSÃO HTTP E TENTATIVAS AUTOMÁTICAS
+# ============================================================
+
 sessao = requests.Session()
+
 sessao.headers.update({
     "User-Agent": "PortalTransparencia-SaoFrancisco/1.0",
     "Accept": "application/json",
 })
 
-# Contadores desta execução
+retries = Retry(
+    total=3,
+    connect=3,
+    read=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
+)
+
+adaptador = HTTPAdapter(max_retries=retries)
+sessao.mount("https://", adaptador)
+sessao.mount("http://", adaptador)
+
+
+# ============================================================
+# ESTATÍSTICAS DA EXECUÇÃO
+# ============================================================
+
 estatisticas = {
     "vereadores": 0,
     "materias": 0,
@@ -50,6 +75,7 @@ estatisticas = {
 # ============================================================
 
 def agora():
+    """Retorna a data e hora atual em UTC."""
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -68,7 +94,7 @@ def valor(dados, *chaves, padrao=None):
 
 
 def nome_relacionado(item):
-    """Extrai nomes de campos que podem ser objetos ou textos."""
+    """Extrai o nome de campos que podem ser textos ou objetos."""
     if isinstance(item, str):
         return item
 
@@ -86,10 +112,31 @@ def nome_relacionado(item):
     return None
 
 
+def normalizar_data(data):
+    """Converte datas ISO para o formato YYYY-MM-DD."""
+    if data is None or data == "":
+        return None
+
+    if not isinstance(data, str):
+        return data
+
+    try:
+        return datetime.fromisoformat(
+            data.replace("Z", "+00:00")
+        ).date().isoformat()
+    except ValueError:
+        # Pode já ser uma data ou um formato diferente.
+        return data
+
+
+# ============================================================
+# BUSCA PAGINADA NA API DO SAPL
+# ============================================================
+
 def buscar_todos(url):
     """
-    Percorre as páginas da API do SAPL.
-    Interrompe a execução se a resposta não tiver o formato esperado.
+    Busca todos os registros disponíveis na API do SAPL,
+    percorrendo a paginação e evitando páginas repetidas.
     """
     resultados = []
     proxima = url
@@ -106,9 +153,19 @@ def buscar_todos(url):
         paginas += 1
 
         if paginas > 10000:
-            raise RuntimeError("Limite de segurança da paginação atingido.")
+            raise RuntimeError(
+                "Limite de segurança da paginação atingido."
+            )
 
-        resposta = sessao.get(proxima, timeout=60)
+        # Guarda a URL da página atual antes de avançar.
+        url_atual = proxima
+
+        print(f"Consultando página {paginas}: {url_atual}")
+
+        resposta = sessao.get(
+            url_atual,
+            timeout=TIMEOUT_REQUISICAO,
+        )
         resposta.raise_for_status()
 
         dados = resposta.json()
@@ -116,39 +173,58 @@ def buscar_todos(url):
         # Algumas APIs retornam uma lista diretamente.
         if isinstance(dados, list):
             resultados.extend(dados)
+            print(
+                f"API: página {paginas} | "
+                f"registros acumulados: {len(resultados)}"
+            )
             break
 
         if not isinstance(dados, dict):
             raise RuntimeError(
-                f"Formato inesperado na API: {proxima}"
+                f"Formato inesperado na API: {url_atual}"
             )
 
         registros = dados.get("results")
 
         if not isinstance(registros, list):
             raise RuntimeError(
-                f"A resposta não contém uma lista 'results': {proxima}"
+                "A resposta não contém uma lista 'results': "
+                f"{url_atual}"
             )
 
         resultados.extend(registros)
 
-        proxima = dados.get("next")
+        proxima_api = dados.get("next")
 
-        if proxima:
-            proxima = urljoin(proxima, proxima)
+        if proxima_api:
+            # Resolve URLs absolutas, relativas ou apenas com query.
+            proxima = urljoin(url_atual, proxima_api)
+        else:
+            proxima = None
 
         print(
             f"API: página {paginas} | "
             f"registros acumulados: {len(resultados)}"
         )
 
-        time.sleep(0.15)
+        if proxima:
+            time.sleep(0.15)
+
+    print(f"Total obtido da API: {len(resultados)} registros.")
 
     return resultados
 
 
+# ============================================================
+# GRAVAÇÃO NO SUPABASE
+# ============================================================
+
 def gravar_lotes(tabela, registros, conflito):
-    """Grava os registros em lotes, usando a chave única informada."""
+    """
+    Insere ou atualiza registros em lotes.
+    A chave de conflito deve corresponder a uma restrição
+    única existente no Supabase.
+    """
     if not registros:
         print(f"{tabela}: nenhum registro para gravar.")
         return 0
@@ -158,25 +234,35 @@ def gravar_lotes(tabela, registros, conflito):
     for inicio in range(0, len(registros), TAMANHO_LOTE):
         lote = registros[inicio:inicio + TAMANHO_LOTE]
 
+        print(
+            f"Gravando {tabela}: "
+            f"lote de {inicio + 1} a {inicio + len(lote)}..."
+        )
+
         supabase.table(tabela).upsert(
             lote,
             on_conflict=conflito,
         ).execute()
 
         total += len(lote)
-        print(f"{tabela}: {total}/{len(registros)} processados.")
+
+        print(
+            f"{tabela}: {total}/{len(registros)} "
+            "registros processados."
+        )
 
     return total
 
 
 # ============================================================
-# VEREADORES
+# SINCRONIZAÇÃO DE VEREADORES
 # ============================================================
 
 def sincronizar_vereadores():
     print("\n=== SINCRONIZANDO VEREADORES ===")
 
     origem = buscar_todos(API_PARLAMENTARES)
+
     registros = []
     ids_vistos = set()
 
@@ -189,7 +275,7 @@ def sincronizar_vereadores():
 
         sapl_id = str(sapl_id)
 
-        # Evita duplicidade dentro da própria resposta.
+        # Evita duplicidade dentro da resposta da API.
         if sapl_id in ids_vistos:
             continue
 
@@ -222,14 +308,20 @@ def sincronizar_vereadores():
             )
 
         if fotografia and isinstance(fotografia, str):
-            fotografia = urljoin(SAPL_BASE + "/", fotografia)
+            fotografia = urljoin(
+                SAPL_BASE + "/",
+                fotografia,
+            )
 
         ativo = valor(pessoa, "ativo")
 
-        # Não presume que uma situação desconhecida seja verdadeira.
-        em_exercicio = ativo if isinstance(ativo, bool) else False
+        # Não presume que um valor desconhecido seja verdadeiro.
+        em_exercicio = (
+            ativo if isinstance(ativo, bool) else False
+        )
 
         titular_origem = valor(pessoa, "titular")
+
         titular = (
             titular_origem
             if isinstance(titular_origem, bool)
@@ -249,7 +341,9 @@ def sincronizar_vereadores():
             "titular": titular,
             "foto_url": fotografia,
             "biografia": valor(pessoa, "biografia"),
-            "fonte_url": f"{SAPL_BASE}/parlamentar/{sapl_id}",
+            "fonte_url": (
+                f"{SAPL_BASE}/parlamentar/{sapl_id}"
+            ),
             "dados_originais": pessoa,
             "coletado_em": agora(),
             "updated_at": agora(),
@@ -271,17 +365,19 @@ def sincronizar_vereadores():
     )
 
     estatisticas["vereadores"] = total
+
     print(f"Vereadores processados: {total}")
 
 
 # ============================================================
-# MATÉRIAS LEGISLATIVAS
+# SINCRONIZAÇÃO DE MATÉRIAS LEGISLATIVAS
 # ============================================================
 
 def sincronizar_materias():
-    print("\n=== SINCRONIZANDO MATÉRIAS ===")
+    print("\n=== SINCRONIZANDO MATÉRIAS LEGISLATIVAS ===")
 
     origem = buscar_todos(API_MATERIAS)
+
     registros = []
     ids_vistos = set()
 
@@ -325,22 +421,27 @@ def sincronizar_materias():
         except (ValueError, TypeError):
             ano = None
 
-        data_apresentacao = valor(
-            materia,
-            "data_apresentacao",
-            "data",
+        data_apresentacao = normalizar_data(
+            valor(
+                materia,
+                "data_apresentacao",
+                "data",
+            )
         )
 
-        # Campos opcionais: se a API não fornecer, ficam nulos.
         registro = {
             "sapl_id": sapl_id,
             "tipo": tipo,
-            "numero": str(numero) if numero is not None else None,
+            "numero": (
+                str(numero) if numero is not None else None
+            ),
             "ano": ano,
             "ementa": valor(materia, "ementa"),
             "data_apresentacao": data_apresentacao,
             "situacao": situacao,
-            "url_oficial": f"{SAPL_BASE}/materia/{sapl_id}",
+            "url_oficial": (
+                f"{SAPL_BASE}/materia/{sapl_id}"
+            ),
             "dados_originais": materia,
             "coletado_em": agora(),
             "updated_at": agora(),
@@ -361,17 +462,24 @@ def sincronizar_materias():
     )
 
     estatisticas["materias"] = total
+
     print(f"Matérias processadas: {total}")
 
 
 # ============================================================
-# REGISTRO DA EXECUÇÃO
+# REGISTRO DA EXECUÇÃO NO SUPABASE
 # ============================================================
 
 def iniciar_log():
+    """
+    Registra o início da sincronização.
+
+    'executando' é permitido pela restrição atual
+    da coluna status na tabela atualizacoes.
+    """
     resultado = supabase.table("atualizacoes").insert({
         "processo": "sincronizacao_sapl",
-        "status": "em_andamento",
+        "status": "executando",
         "inicio_em": agora(),
         "registros_lidos": 0,
         "registros_inseridos": 0,
@@ -385,10 +493,15 @@ def iniciar_log():
             "Não foi possível criar o registro de execução."
         )
 
-    return resultado.data[0]["id"]
+    log_id = resultado.data[0]["id"]
+
+    print(f"Registro de execução criado: {log_id}")
+
+    return log_id
 
 
 def finalizar_log(log_id, sucesso, mensagem):
+    """Atualiza o registro de execução com o resultado final."""
     lidos = (
         estatisticas["vereadores"]
         + estatisticas["materias"]
@@ -404,13 +517,18 @@ def finalizar_log(log_id, sucesso, mensagem):
         "status": "sucesso" if sucesso else "erro",
         "fim_em": agora(),
         "registros_lidos": lidos,
-        # Upsert não informa com precisão quantos foram inseridos
-        # e quantos foram atualizados. Não inventamos essa divisão.
+        # O upsert não separa, por si só, novos registros
+        # de registros atualizados. Não inventamos os números.
         "registros_inseridos": 0,
         "registros_atualizados": 0,
         "mensagem": mensagem,
         "detalhes": detalhes,
     }).eq("id", log_id).execute()
+
+    print(
+        "Histórico atualizado: "
+        f"{'sucesso' if sucesso else 'erro'}."
+    )
 
 
 # ============================================================
@@ -418,7 +536,10 @@ def finalizar_log(log_id, sucesso, mensagem):
 # ============================================================
 
 def sincronizar_dados():
-    print("Iniciando sincronização com o SAPL de São Francisco-MG.")
+    print(
+        "Iniciando sincronização com o SAPL "
+        "de São Francisco-MG."
+    )
 
     log_id = iniciar_log()
 
@@ -432,20 +553,34 @@ def sincronizar_dados():
             "Sincronização de vereadores e matérias concluída.",
         )
 
-        print("\nSincronização concluída.")
-        print(f"Vereadores processados: {estatisticas['vereadores']}")
-        print(f"Matérias processadas: {estatisticas['materias']}")
+        print("\n=== SINCRONIZAÇÃO CONCLUÍDA ===")
+        print(
+            "Vereadores processados: "
+            f"{estatisticas['vereadores']}"
+        )
+        print(
+            "Matérias processadas: "
+            f"{estatisticas['materias']}"
+        )
 
     except Exception as erro:
         mensagem = f"{type(erro).__name__}: {erro}"
+
         estatisticas["erros"].append(mensagem)
 
         print(f"\nERRO NA SINCRONIZAÇÃO: {mensagem}")
 
         try:
-            finalizar_log(log_id, False, mensagem)
+            finalizar_log(
+                log_id,
+                False,
+                mensagem,
+            )
         except Exception as erro_log:
-            print(f"Também não foi possível atualizar o log: {erro_log}")
+            print(
+                "Também não foi possível atualizar "
+                f"o histórico: {erro_log}"
+            )
 
         raise
 
