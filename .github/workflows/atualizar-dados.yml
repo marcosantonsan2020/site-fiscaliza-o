@@ -1,0 +1,30 @@
+name: Atualizar Dados da Câmara Automaticamente
+
+on:
+  schedule:
+    # Roda toda segunda-feira à 00:00 (Você pode alterar o horário se preferir)
+    - cron: '0 0 * * 1'
+  workflow_dispatch: # Permite que você clique num botão para rodar manualmente quando quiser
+
+jobs:
+  atualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Copiar código do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar ambiente Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Instalar dependências (Supabase e requests)
+        run: |
+          pip install supabase requests
+
+      - name: Executar script de atualização
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          python atualizar.py
